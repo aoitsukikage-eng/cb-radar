@@ -4,24 +4,25 @@
 
 用法：pytest test_build.py -v
 """
+from decimal import Decimal
 import time
 
 import pandas as pd
 import pytest
 
-from build import calc_valuation
+from build import MIN_VOLUME, calc_valuation, select_known_adjustments
 
 DAY = "2026-10-22"
 STARTED = "20200101"      # 早就開始的轉換期間
 NOT_STARTED = "20270101"  # 還沒開始的轉換期間
 
 
-def row(cb_close=100.0, stock_close=100.0, conv_price_now=100.0,
+def row(cb_close=100.0, stock_close=100.0, conv_price_now=100.0, volume=100,
         conv_start=STARTED, cb_name="測試一", cb_id="11111", stock_id="1111"):
-    """建一筆最小輸入列，預設是「剛好打平、可轉換、有成交」的正常案例。"""
+    """建一筆最小輸入列，預設是「剛好打平、可轉換、有成交、量夠」的正常案例。"""
     return pd.DataFrame([{
         "cb_id": cb_id, "cb_name": cb_name, "stock_id": stock_id,
-        "cb_close": cb_close, "stock_close": stock_close,
+        "cb_close": cb_close, "stock_close": stock_close, "volume": volume,
         "conv_price_now": conv_price_now, "conv_start": conv_start, "date": DAY,
     }])
 
@@ -141,3 +142,78 @@ def test_no_duplicate_signal_per_cb_per_day():
     df = pd.concat([row(cb_id="11111"), row(cb_id="22222")], ignore_index=True)
     out = calc_valuation(df)
     assert not out["cb_id"].duplicated().any()
+
+
+# ── 流動性門檻：量太薄不當訊號，即使折價 ──────────────────────
+def test_signal_none_when_volume_too_thin():
+    r = calc1(cb_close=90, volume=MIN_VOLUME - 1)
+    assert r["signal"] == "none"
+    assert r["premium"] == pytest.approx(-0.10)  # premium 照算，只是不當訊號
+
+
+def test_signal_candidate_when_volume_enough():
+    r = calc1(cb_close=98, volume=MIN_VOLUME)  # 剛好等於門檻，算夠
+    assert r["signal"] == "candidate"
+
+
+def test_signal_suspect_still_needs_volume():
+    r = calc1(cb_close=80, volume=0)  # 深度折價但量是 0
+    assert r["signal"] == "none"
+
+
+# ── Point-in-time：select_known_adjustments 只留「當時已經知道」的調整 ──
+def adj_row(cb_id, conv_price, effective_date, recorded_at=None):
+    return {"cb_id": cb_id, "conv_price": conv_price, "effective_date": effective_date,
+            "recorded_at": recorded_at}
+
+
+def test_known_adjustments_excludes_future_effective_date():
+    adj = pd.DataFrame([adj_row("11111", "90", "2027-01-01", "2026-01-01")])
+    known = select_known_adjustments(adj, "2026-06-01")
+    assert known.empty
+
+
+def test_known_adjustments_excludes_not_yet_recorded():
+    """生效日在過去，但我們是後來才抓到的（公告有延遲）：build 那天還不知道，不能用。"""
+    adj = pd.DataFrame([adj_row("11111", "90", "2026-01-01", "2026-09-01")])
+    known = select_known_adjustments(adj, "2026-06-01")
+    assert known.empty
+
+
+def test_known_adjustments_includes_when_both_in_past():
+    adj = pd.DataFrame([adj_row("11111", "90", "2026-01-01", "2026-01-15")])
+    known = select_known_adjustments(adj, "2026-06-01")
+    assert len(known) == 1
+    assert known.iloc[0]["conv_price"] == "90"
+
+
+def test_known_adjustments_missing_recorded_at_falls_back_to_effective_date():
+    """沒記錄 recorded_at（舊資料）時，保守假設跟生效日同時已知。"""
+    adj = pd.DataFrame([adj_row("11111", "90", "2026-01-01", None)])
+    known = select_known_adjustments(adj, "2026-06-01")
+    assert len(known) == 1
+
+
+def test_known_adjustments_picks_latest_effective_date_per_cb():
+    adj = pd.DataFrame([
+        adj_row("11111", "90", "2026-01-01", "2026-01-01"),
+        adj_row("11111", "85", "2026-03-01", "2026-03-01"),
+    ])
+    known = select_known_adjustments(adj, "2026-06-01")
+    assert len(known) == 1
+    assert known.iloc[0]["conv_price"] == "85"
+
+
+# ── Decimal 精確運算：避開 float 二進位誤差 ─────────────────────
+def test_decimal_avoids_float_binary_error():
+    """0.1 這種數字二進位表示法本身就有誤差；用 Decimal(str(...)) 建構才能避開。"""
+    r = calc1(cb_close=100.1, stock_close=100, conv_price_now=100)
+    expected = (Decimal("100.1") / Decimal("100") - 1).quantize(Decimal("0.000001"))
+    assert r["premium"] == pytest.approx(float(expected), abs=1e-12)
+
+
+def test_decimal_result_is_quantized():
+    """算出來的 premium 小數位數要落在量化精度內，不是未量化的浮點雜訊。"""
+    r = calc1(cb_close=97, stock_close=133, conv_price_now=41)
+    # 乘 1e6 後應該非常接近整數（量化到小數 6 位）
+    assert abs(r["premium"] * 1e6 - round(r["premium"] * 1e6)) < 1e-6

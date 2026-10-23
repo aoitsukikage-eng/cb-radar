@@ -66,6 +66,7 @@
         fmtNum(r.cb_close, 2),
         fmtNum(r.stock_close, 2),
         fmtNum(r.conv_price_now, 2),
+        r.volume == null ? "—" : Math.round(r.volume).toLocaleString(),
         r.inst_net_5d == null ? "—" : Math.round(r.inst_net_5d).toLocaleString(),
       ];
       cells.forEach((text, i) => {

@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import sqlite3
 import sys
+from decimal import ROUND_HALF_UP, Decimal
 
 import numpy as np
 import pandas as pd
@@ -16,8 +17,9 @@ import config as C
 WEB_DIR = C.DATA_DIR.parent / "docs" / "data"
 HISTORY_DAYS = 60  # 網頁歷史圖保留的交易日數
 LATEST_FIELDS = ["cb_id", "cb_name", "stock_id", "cb_close", "stock_close", "conv_price_now",
-                 "premium", "premium_null_reason", "signal", "inst_net_5d",
-                 "traded_today", "conv_not_started", "is_exchangeable", "date", "conv_price_asof"]
+                 "premium", "premium_null_reason", "signal", "inst_net_5d", "volume",
+                 "traded_today", "conv_not_started", "is_exchangeable", "date",
+                 "conv_price_asof", "fetched_at"]
 HISTORY_FIELDS = ["cb_id", "cb_name", "date", "premium", "traded_today"]
 
 # 健康檢查／訊號分級的警戒線（依 2026-10-21 正常資料設定：389 檔、99.5% 有股價、44% 有成交）
@@ -26,11 +28,21 @@ MIN_STOCK_COVERAGE = 0.95  # 有股價的比例
 MIN_TRADED_RATIO = 0.15    # 有成交的比例；太低通常是抓到非交易日或行情檔不完整
 SUSPICIOUS_DISCOUNT = -0.05  # 折價超過 5% 很少見，多半是轉換價沒更新
 EXTREME_PREMIUM = 5.0        # 溢價率超過 500%，可轉債幾乎只剩債券價值
+MIN_VOLUME = 10              # 成交量（張）低於這個數，量太薄不當訊號；粗略估計值，可調
 
 
 def load(day, name):
     p = C.RAW_DIR / day / f"{name}.json"
     return pd.DataFrame(json.loads(p.read_text(encoding="utf-8"))) if p.exists() else pd.DataFrame()
+
+
+def fetched_at(day):
+    """讀 fetch.py 寫的 _meta.json，回傳這批原始資料的抓取時間；沒有就回傳 None
+    （例如舊資料、或手動補的歷史資料沒有這個檔案）。"""
+    p = C.RAW_DIR / day / "_meta.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8")).get("fetched_at")
 
 
 def pick(df, fields):
@@ -45,13 +57,27 @@ def to_num(s):
     return pd.to_numeric(s.astype(str).str.replace(",", "").str.strip(), errors="coerce")
 
 
-def adjusted_prices():
-    """轉換價調整表：從 MOPS 公告整理，格式 cb_id, conv_price, effective_date。
+def select_known_adjustments(adj, day):
+    """只留『當時已經知道』的轉換價調整：生效日 <= day，而且是我們在 day（含）之前抓到的。
+
+    `recorded_at` 缺值（舊資料沒記錄抓取時間）時，保守假設跟 effective_date 同時已知。
+    抽成獨立函式方便單獨測試，不用碰檔案系統。
+    """
+    if adj.empty:
+        return adj
+    recorded_at = adj["recorded_at"].fillna(adj["effective_date"]) if "recorded_at" in adj else adj["effective_date"]
+    known = adj[(adj["effective_date"] <= day) & (recorded_at <= day)]
+    return known.sort_values("effective_date").groupby("cb_id").tail(1)
+
+
+def adjusted_prices(day):
+    """轉換價調整表：從 MOPS 公告整理，格式 cb_id, conv_price, effective_date[, recorded_at]。
     MOPS 爬蟲沿用既有監控工具，輸出成 data/conv_price_adjustments.csv 即可。
 
-    回傳值多一個 asof：這份調整表「目前最新一筆的生效日」，隨 build() 結果一起存起來，
-    之後回頭看任何一筆歷史 premium，都能知道它是用哪個版本的轉換價表算出來的
-    （避免之後重新執行 build.py 時，用「現在才知道的回溯調整」悄悄覆蓋「那天當時看到的轉換價」）。
+    只套用「day 當時已經知道」的調整（見 select_known_adjustments），避免之後重新執行
+    build.py 處理過去日期時，用「現在才知道的回溯調整」悄悄覆蓋「那天當時看到的轉換價」
+    （look-ahead bias）。回傳值多一個 asof：這次實際套用的調整裡最新的生效日，隨 build()
+    結果一起存起來，方便回頭追查每一筆歷史 premium 是依據哪個版本算出來的。
     """
     p = C.DATA_DIR / "conv_price_adjustments.csv"
     if not p.exists():
@@ -64,22 +90,42 @@ def adjusted_prices():
         raise KeyError(f"conv_price_adjustments.csv 第一行要是 cb_id,conv_price,effective_date，"
                        f"目前讀到的是 {list(adj.columns)}")
     adj["cb_id"] = adj["cb_id"].str.strip()
-    adj = adj.sort_values("effective_date")
-    asof = adj["effective_date"].max() if len(adj) else None
-    latest = adj.groupby("cb_id").tail(1).rename(columns={"conv_price": "conv_price_adj"})[["cb_id", "conv_price_adj"]]
+    known = select_known_adjustments(adj, day)
+    asof = known["effective_date"].max() if len(known) else None
+    latest = known.rename(columns={"conv_price": "conv_price_adj"})[["cb_id", "conv_price_adj"]]
     return latest, asof
+
+
+def _dec(x):
+    """字串轉 Decimal，避免 float 轉換再引入新的二進位誤差；缺值回傳 None。"""
+    return None if pd.isna(x) else Decimal(str(x))
+
+
+def _valuation_decimal(row):
+    """單列算轉換價值、溢價率，核心除法用 Decimal 避免浮點誤差，算完量化再轉回 float。
+
+    上游資料從 CSV/JSON 字串轉 float（to_num）這一步本來就已經過一次二進位轉換；
+    這裡只處理「核心除法」這一段的精度，不是從頭到尾的字串-to-Decimal 全鏈路——
+    對 400 多檔、台股最小跳動單位的場景，再往上游改沒有實際差異，風險／效益不成比例。
+    """
+    conv_price_now, stock_close, cb_close = (_dec(row["conv_price_now"]), _dec(row["stock_close"]),
+                                               _dec(row["cb_close"]))
+    if conv_price_now is None or stock_close is None or cb_close is None or conv_price_now <= 0:
+        return float("nan"), float("nan")
+    conv_value = (Decimal(100) / conv_price_now * stock_close).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    premium = (cb_close / conv_value - 1).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    return float(conv_value), float(premium)
 
 
 def calc_valuation(df):
     """核心公式：轉換價值、溢價率，以及 null 理由代碼與訊號分級。
 
-    輸入 df 至少要有 cb_close, stock_close, conv_price_now, conv_start, cb_name, date 欄位。
+    輸入 df 至少要有 cb_close, stock_close, conv_price_now, conv_start, cb_name, date, volume 欄位。
     回傳加上 conv_value, premium, premium_null_reason, is_exchangeable, conv_not_started,
     traded_today, signal 的 df。抽成獨立函式方便單獨測試，不用跑整條 fetch+merge 流程。
     """
     t = df.copy()
-    t["conv_value"] = 100 / t["conv_price_now"] * t["stock_close"]
-    t["premium"] = t["cb_close"] / t["conv_value"] - 1
+    t[["conv_value", "premium"]] = t.apply(_valuation_decimal, axis=1, result_type="expand")
 
     t["is_exchangeable"] = t["cb_name"].astype(str).str.contains("E")  # 交換債，換的是別家股票
     t["conv_not_started"] = pd.to_numeric(t["conv_start"], errors="coerce") > t["date"].str.replace("-", "").astype(int)
@@ -96,8 +142,11 @@ def calc_valuation(df):
     t["premium_null_reason"] = reason
     t.loc[reason.notna(), "premium"] = float("nan")
 
-    # 訊號分級：跟「這數字能不能直接拿來判斷套利」分開判斷，複用健康檢查的門檻
-    tradable = t["traded_today"] & ~t["conv_not_started"] & ~t["is_exchangeable"] & t["premium"].notna()
+    # 訊號分級：跟「這數字能不能直接拿來判斷套利」分開判斷，複用健康檢查的門檻＋成交量門檻
+    # （成交量太薄，就算折價也不是能執行的訊號，只是沒人要賣）
+    enough_volume = pd.to_numeric(t["volume"], errors="coerce").fillna(0) >= MIN_VOLUME
+    tradable = (t["traded_today"] & ~t["conv_not_started"] & ~t["is_exchangeable"]
+                & t["premium"].notna() & enough_volume)
     t["signal"] = "none"
     t.loc[tradable & (t["premium"] < 0) & (t["premium"] >= SUSPICIOUS_DISCOUNT), "signal"] = "candidate"
     t.loc[tradable & (t["premium"] < SUSPICIOUS_DISCOUNT), "signal"] = "suspect"
@@ -137,18 +186,19 @@ def build(day):
         df[col] = df[col].astype(str).str.strip()
     terms["stock_id"] = terms["cb_id"].str[:4]
 
-    adj, conv_price_asof = adjusted_prices()
+    adj, conv_price_asof = adjusted_prices(day)
     t = (terms.merge(quotes, on="cb_id", how="left")
               .merge(stocks, on="stock_id", how="left")
               .merge(adj, on="cb_id", how="left"))
 
-    for col in ["conv_price", "conv_price_adj", "cb_close", "stock_close", "put_price"]:
+    for col in ["conv_price", "conv_price_adj", "cb_close", "stock_close", "put_price", "volume"]:
         if col in t:
             t[col] = to_num(t[col])
     # 有調整過就用最新轉換價，否則用發行時轉換價
     t["conv_price_now"] = t["conv_price_adj"].fillna(t["conv_price"])
     t["date"] = day
     t["conv_price_asof"] = conv_price_asof  # 這批 premium 是用哪個版本的轉換價調整表算出來的
+    t["fetched_at"] = fetched_at(day)  # 這批原始資料是哪次 fetch.py 跑出來的
 
     t = calc_valuation(t)
 
