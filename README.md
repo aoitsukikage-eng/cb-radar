@@ -83,12 +83,27 @@ cb_id,conv_price,effective_date
 | `cb_close`、`stock_close` | 可轉債、股票收盤價 |
 | `conv_price_now` | 計算用的轉換價 |
 | `premium` | 溢價率，`-0.02` 代表 −2% |
+| `premium_null_reason` | `premium` 是空值時，為什麼（`not_traded`／`no_stock_price`／`no_conv_price`／`exchangeable`），正常有算出來時是 `None` |
+| `signal` | 訊號分級：`candidate`（折價且可執行，值得看一眼）／`suspect`（深度折價，多半是轉換價沒更新，別當成機會）／`none`（其他） |
+| `conv_price_asof` | 這筆資料用的轉換價調整表版本（`conv_price_adjustments.csv` 當時最新一筆的生效日），方便回頭追某天的 premium 是依據哪個版本算出來的 |
 | `inst_net_5d` | 三大法人近 5 日買賣超（張） |
 | `traded_today` | 當天有沒有成交（約一半沒有） |
 | `conv_not_started` | 轉換期間還沒開始，不能套利 |
 | `is_exchangeable` | 交換債（名稱有 E），換的是別家股票，溢價率已清空 |
 
 私募債（代號不是數字）已自動排除。
+
+## 網頁（docs/）
+
+`build.py` 最後會把當天排行榜寫成 `docs/data/latest.json`，近 60 個交易日的溢價率走勢寫成
+`docs/data/history.json`，給 `docs/index.html`（純 HTML/CSS/JS，沒有框架、沒有後端）讀取顯示：
+
+- 表格依溢價率排序，可篩選「只看今天有成交」「排除還不能轉換」「排除交換債」
+- `signal = candidate` 的列會標綠色「訊號」，`suspect` 標橘色「⚠ 資料可疑」
+- 點一列會跳出該檔過去幾天的溢價率走勢圖
+
+用 GitHub Pages（從 `main` 分支的 `/docs` 資料夾）部署，每次 Actions 把新的 JSON push 回 `main` 就會自動重新部署，不需要另外架伺服器。
+本機預覽：`python -m http.server --directory docs`。
 
 ## 健康檢查
 
